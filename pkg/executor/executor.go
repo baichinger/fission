@@ -19,6 +19,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"github.com/dgraph-io/ristretto"
 	"net/http"
 	"os"
 	"strconv"
@@ -55,6 +56,8 @@ type (
 
 		requestChan chan *createFuncServiceRequest
 		fsCreateWg  map[string]*sync.WaitGroup
+
+		fnCache *ristretto.Cache
 	}
 
 	createFuncServiceRequest struct {
@@ -71,6 +74,16 @@ type (
 // MakeExecutor returns an Executor for given ExecutorType(s).
 func MakeExecutor(logger *zap.Logger, cms *cms.ConfigSecretController,
 	fissionClient *crd.FissionClient, types map[fv1.ExecutorType]executortype.ExecutorType) (*Executor, error) {
+
+	fnCache, err := ristretto.NewCache(&ristretto.Config{
+		NumCounters: 1000000,
+		MaxCost:     1,
+		BufferItems: 64,
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	executor := &Executor{
 		logger:        logger.Named("executor"),
 		cms:           cms,
@@ -79,6 +92,8 @@ func MakeExecutor(logger *zap.Logger, cms *cms.ConfigSecretController,
 
 		requestChan: make(chan *createFuncServiceRequest),
 		fsCreateWg:  make(map[string]*sync.WaitGroup),
+
+		fnCache: fnCache,
 	}
 	for _, et := range types {
 		go func(et executortype.ExecutorType) {

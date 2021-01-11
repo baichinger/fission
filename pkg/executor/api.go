@@ -19,9 +19,11 @@ package executor
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/fission/fission/pkg/apis/core/v1"
 	"io/ioutil"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/hashicorp/go-multierror"
@@ -51,14 +53,23 @@ func (executor *Executor) getServiceForFunctionAPI(w http.ResponseWriter, r *htt
 		return
 	}
 
-	fn, err := executor.fissionClient.CoreV1().Functions(m.Namespace).Get(m.Name, metav1.GetOptions{})
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			http.Error(w, "Failed to find function", http.StatusNotFound)
-		} else {
-			http.Error(w, "Failed to get function", http.StatusInternalServerError)
+	var fn *v1.Function
+
+	fnCacheKey := m.Name + "." + m.Namespace
+	if cachedFn, hit := executor.fnCache.Get(fnCacheKey); hit {
+		fn = cachedFn.(*v1.Function)
+	} else {
+		fn, err = executor.fissionClient.CoreV1().Functions(m.Namespace).Get(m.Name, metav1.GetOptions{})
+		if err != nil {
+			if k8serrors.IsNotFound(err) {
+				http.Error(w, "Failed to find function", http.StatusNotFound)
+			} else {
+				http.Error(w, "Failed to get function", http.StatusInternalServerError)
+			}
+			return
 		}
-		return
+		executor.fnCache.SetWithTTL(fnCacheKey, fn, 0, time.Minute)
+		executor.logger.Debug("function cache miss", zap.String("namespace", m.Namespace), zap.String("name", m.Name))
 	}
 
 	t := fn.Spec.InvokeStrategy.ExecutionStrategy.ExecutorType

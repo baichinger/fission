@@ -19,6 +19,7 @@ package poolmgr
 import (
 	"context"
 	"fmt"
+	"github.com/dgraph-io/ristretto"
 	"math/rand"
 	"os"
 	"strconv"
@@ -78,6 +79,8 @@ type (
 		pkgController  k8sCache.Controller
 
 		defaultIdlePodReapTime time.Duration
+
+		podCache *ristretto.Cache
 	}
 	request struct {
 		requestType
@@ -101,6 +104,15 @@ func MakeGenericPoolManager(
 
 	gpmLogger := logger.Named("generic_pool_manager")
 
+	podCache, err := ristretto.NewCache(&ristretto.Config{
+		NumCounters: 1000000,
+		MaxCost:     1,
+		BufferItems: 64,
+	})
+	if err != nil {
+		return nil
+	}
+
 	gpm := &GenericPoolManager{
 		logger:                 gpmLogger,
 		pools:                  make(map[string]*GenericPool),
@@ -113,6 +125,7 @@ func MakeGenericPoolManager(
 		requestChannel:         make(chan *request),
 		defaultIdlePodReapTime: 2 * time.Minute,
 		fetcherConfig:          fetcherConfig,
+		podCache:               podCache,
 	}
 
 	go gpm.service()
@@ -194,8 +207,18 @@ func (gpm *GenericPoolManager) TapService(svcHost string) error {
 func (gpm *GenericPoolManager) IsValid(fsvc *fscache.FuncSvc) bool {
 	for _, obj := range fsvc.KubernetesObjects {
 		if strings.ToLower(obj.Kind) == "pod" {
-			pod, err := gpm.kubernetesClient.CoreV1().Pods(obj.Namespace).Get(obj.Name, metav1.GetOptions{})
-			if err == nil && utils.IsReadyPod(pod) {
+			var pod *apiv1.Pod = nil
+
+			podCacheKey := obj.Name + "." + obj.Namespace
+			if cachedPod, hit := gpm.podCache.Get(podCacheKey); hit {
+				pod = cachedPod.(*apiv1.Pod)
+			} else {
+				pod, _ = gpm.kubernetesClient.CoreV1().Pods(obj.Namespace).Get(obj.Name, metav1.GetOptions{})
+				gpm.podCache.SetWithTTL(podCacheKey, pod, 0, time.Minute)
+				gpm.logger.Debug("pod cache miss", zap.String("namespace", obj.Namespace), zap.String("name", obj.Name))
+			}
+
+			if pod != nil && utils.IsReadyPod(pod) {
 				// Normally, the address format is http://[pod-ip]:[port], however, if the
 				// Istio is enabled the address format changes to http://[svc-name]:[port].
 				// So if the Istio is enabled and pod is in ready state, we return true directly;
